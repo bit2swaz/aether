@@ -17,24 +17,24 @@ func TestExecute(t *testing.T) {
 	}
 	defer store.Close()
 
-	_, _, err = store.Execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+	_, _, err = store.Query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
 	if err != nil {
 		t.Fatalf("Failed to create table: %v", err)
 	}
 	t.Log("Table created")
 
-	_, _, err = store.Execute("INSERT INTO users (name, age) VALUES ('Alice', 30)")
+	_, _, err = store.Query("INSERT INTO users (name, age) VALUES ('Alice', 30)")
 	if err != nil {
 		t.Fatalf("Failed to insert data: %v", err)
 	}
 	t.Log("Data inserted")
 
-	_, _, err = store.Execute("INSERT INTO users (name, age) VALUES ('Bob', 25)")
+	_, _, err = store.Query("INSERT INTO users (name, age) VALUES ('Bob', 25)")
 	if err != nil {
 		t.Fatalf("Failed to insert second row: %v", err)
 	}
 
-	fieldDesc, rows, err := store.Execute("SELECT id, name, age FROM users ORDER BY id")
+	fieldDesc, rows, err := store.Query("SELECT id, name, age FROM users ORDER BY id")
 	if err != nil {
 		t.Fatalf("Failed to select data: %v", err)
 	}
@@ -92,12 +92,12 @@ func TestExecuteEmptyResult(t *testing.T) {
 	}
 	defer store.Close()
 
-	_, _, err = store.Execute("CREATE TABLE empty_table (id INTEGER)")
+	_, _, err = store.Query("CREATE TABLE empty_table (id INTEGER)")
 	if err != nil {
 		t.Fatalf("Failed to create table: %v", err)
 	}
 
-	fieldDesc, rows, err := store.Execute("SELECT * FROM empty_table")
+	fieldDesc, rows, err := store.Query("SELECT * FROM empty_table")
 	if err != nil {
 		t.Fatalf("Failed to query empty table: %v", err)
 	}

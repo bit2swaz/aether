@@ -209,11 +209,11 @@ func TestRealDatabaseQuery(t *testing.T) {
 	}
 	defer globalStore.Close()
 
-	_, _, err = globalStore.Execute("CREATE TABLE test_table (id INTEGER, name TEXT)")
+	_, _, err = globalStore.Query("CREATE TABLE test_table (id INTEGER, name TEXT)")
 	if err != nil {
 		t.Fatalf("Failed to create table: %v", err)
 	}
-	_, _, err = globalStore.Execute("INSERT INTO test_table VALUES (1, 'Aether')")
+	_, _, err = globalStore.Query("INSERT INTO test_table VALUES (1, 'Aether')")
 	if err != nil {
 		t.Fatalf("Failed to insert data: %v", err)
 	}

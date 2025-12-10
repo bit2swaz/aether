@@ -63,7 +63,7 @@ func TestStoreLifecycle(t *testing.T) {
 	}
 	t.Log("Store initialized")
 
-	fieldDesc, rows, err := store.Execute("CREATE TABLE test (id INTEGER, name TEXT)")
+	fieldDesc, rows, err := store.Query("CREATE TABLE test (id INTEGER, name TEXT)")
 	if err != nil {
 		t.Fatalf("Failed to create table: %v", err)
 	}
@@ -75,13 +75,13 @@ func TestStoreLifecycle(t *testing.T) {
 	}
 	t.Log("Table created")
 
-	fieldDesc, rows, err = store.Execute("INSERT INTO test VALUES (1, 'Aether')")
+	fieldDesc, rows, err = store.Query("INSERT INTO test VALUES (1, 'Aether')")
 	if err != nil {
 		t.Fatalf("Failed to insert data: %v", err)
 	}
 	t.Log("Data inserted")
 
-	fieldDesc, rows, err = store.Execute("SELECT id, name FROM test")
+	fieldDesc, rows, err = store.Query("SELECT id, name FROM test")
 	if err != nil {
 		t.Fatalf("Failed to select data: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestStoreLifecycle(t *testing.T) {
 	defer store.Close()
 	t.Log("Store re-opened")
 
-	fieldDesc, rows, err = store.Execute("SELECT id, name FROM test")
+	fieldDesc, rows, err = store.Query("SELECT id, name FROM test")
 	if err != nil {
 		t.Fatalf("Failed to select data after re-open: %v", err)
 	}

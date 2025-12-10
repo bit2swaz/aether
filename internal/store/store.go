@@ -2,14 +2,29 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
+	"time"
 
+	"github.com/hashicorp/raft"
 	"github.com/jackc/pgproto3/v2"
 	_ "github.com/mattn/go-sqlite3"
 )
 
+type LogCommand struct {
+	Type string
+	SQL  string
+}
+
+type ApplyResponse struct {
+	Error  error
+	Result sql.Result
+}
+
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	raft *raft.Raft
 }
 
 func New(dbPath string) (*Store, error) {
@@ -42,7 +57,7 @@ func (s *Store) Ping() error {
 	return s.db.Ping()
 }
 
-func (s *Store) Execute(sql string) ([]pgproto3.FieldDescription, [][][]byte, error) {
+func (s *Store) Query(sql string) ([]pgproto3.FieldDescription, [][][]byte, error) {
 	rows, err := s.db.Query(sql)
 	if err != nil {
 		return nil, nil, fmt.Errorf("query failed: %w", err)
@@ -63,7 +78,7 @@ func (s *Store) Execute(sql string) ([]pgproto3.FieldDescription, [][][]byte, er
 			DataTypeOID:          OIDText,
 			DataTypeSize:         -1,
 			TypeModifier:         -1,
-			Format:               0, 
+			Format:               0,
 		}
 	}
 
@@ -99,4 +114,71 @@ func (s *Store) Execute(sql string) ([]pgproto3.FieldDescription, [][][]byte, er
 	}
 
 	return fieldDescriptions, resultRows, nil
+}
+
+func (s *Store) Apply(log *raft.Log) interface{} {
+	var cmd LogCommand
+	if err := json.Unmarshal(log.Data, &cmd); err != nil {
+		return &ApplyResponse{
+			Error: fmt.Errorf("failed to unmarshal command: %w", err),
+		}
+	}
+
+	if cmd.Type == "EXECUTE" {
+		result, err := s.db.Exec(cmd.SQL)
+		return &ApplyResponse{
+			Error:  err,
+			Result: result,
+		}
+	}
+
+	return &ApplyResponse{
+		Error: fmt.Errorf("unknown command type: %s", cmd.Type),
+	}
+}
+
+func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
+	return nil, nil
+}
+
+func (s *Store) Restore(snapshot io.ReadCloser) error {
+	return nil
+}
+
+func (s *Store) SetRaft(r *raft.Raft) {
+	s.raft = r
+}
+
+func (s *Store) Replicate(sql string) error {
+	if s.raft == nil {
+		return fmt.Errorf("raft instance not initialized")
+	}
+
+	cmd := LogCommand{
+		Type: "EXECUTE",
+		SQL:  sql,
+	}
+
+	bytes, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to marshal command: %w", err)
+	}
+
+	timeout := 10 * time.Second
+	future := s.raft.Apply(bytes, timeout)
+
+	if err := future.Error(); err != nil {
+		return fmt.Errorf("raft apply failed: %w", err)
+	}
+
+	response := future.Response()
+	if response != nil {
+		if applyResp, ok := response.(*ApplyResponse); ok {
+			if applyResp.Error != nil {
+				return fmt.Errorf("fsm execution failed: %w", applyResp.Error)
+			}
+		}
+	}
+
+	return nil
 }

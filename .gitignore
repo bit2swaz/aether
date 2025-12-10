@@ -1,1 +1,21 @@
+# Database Files (SQLite)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Raft Data
+raft-data/
+node*/
+
+# Binaries
+aether
 bin/
+*.exe
+
+# Test Files
+*.sh
+
+# OS/IDE
+.DS_Store
+.vscode/
