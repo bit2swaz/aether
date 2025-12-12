@@ -19,6 +19,11 @@ func New(nodeID, raftPort, dataDir string, fsm raft.FSM) (*Consensus, error) {
 	config := raft.DefaultConfig()
 	config.LocalID = raft.ServerID(nodeID)
 
+	// Aggressive snapshotting for testing snapshot restore
+	config.SnapshotInterval = 20 * time.Second
+	config.SnapshotThreshold = 500
+	config.TrailingLogs = 10 // Keep only 10 logs after snapshot - forces snapshot install
+
 	bindAddr := fmt.Sprintf("0.0.0.0:%s", raftPort)
 	advertiseAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("127.0.0.1:%s", raftPort))
 	if err != nil {
@@ -43,7 +48,11 @@ func New(nodeID, raftPort, dataDir string, fsm raft.FSM) (*Consensus, error) {
 	logStore := boltStore
 	stableStore := boltStore
 
-	snapshotStore := raft.NewInmemSnapshotStore()
+	snapshotDir := filepath.Join(dataDir, "snapshots")
+	snapshotStore, err := raft.NewFileSnapshotStore(snapshotDir, 3, os.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create snapshot store: %w", err)
+	}
 
 	r, err := raft.NewRaft(config, fsm, logStore, stableStore, snapshotStore, transport)
 	if err != nil {

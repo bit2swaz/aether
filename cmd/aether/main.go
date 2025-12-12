@@ -66,23 +66,45 @@ func main() {
 
 	globalStore.SetRaft(globalConsensus.Raft())
 
+	// Simple bootstrap wait
 	if *nodeID == "node1" {
-		err = globalConsensus.WaitForLeader(30 * time.Second)
-		if err != nil {
-			panic(fmt.Sprintf("Failed to elect leader: %v", err))
-		}
-		slog.Info("Leader elected")
+		// We don't strictly panic here because in a restart scenario,
+		// we might wait for peers. Just a warning log is safer.
+		go func() {
+			err := globalConsensus.WaitForLeader(30 * time.Second)
+			if err != nil {
+				slog.Warn("Leader election taking a while...", "error", err)
+			} else {
+				slog.Info("Leader elected")
+			}
+		}()
 	}
 
 	go startAdminServer(*httpPort, *nodeID, *raftPort)
 
+	// Give the admin server a moment to start
+	if *nodeID == "node1" {
+		time.Sleep(500 * time.Millisecond)
+	}
+
 	if *joinAddr != "" {
-		err = joinCluster(*joinAddr, *nodeID, fmt.Sprintf("127.0.0.1:%d", *raftPort))
-		if err != nil {
-			slog.Error("Failed to join cluster", "error", err)
-			panic(err)
-		}
-		slog.Info("Successfully joined cluster", "leader", *joinAddr)
+		// Retry logic for joining the cluster
+		go func() {
+			maxRetries := 20
+			for i := 0; i < maxRetries; i++ {
+				// Wait a bit before first attempt to let leader settle
+				time.Sleep(time.Duration(1000) * time.Millisecond)
+
+				err = joinCluster(*joinAddr, *nodeID, fmt.Sprintf("127.0.0.1:%d", *raftPort))
+				if err == nil {
+					slog.Info("Successfully joined cluster", "leader", *joinAddr)
+					return
+				}
+
+				slog.Warn("Join attempt failed, retrying...", "attempt", i+1, "error", err)
+			}
+			slog.Error("Failed to join cluster after max retries")
+		}()
 	}
 
 	pgAddr := fmt.Sprintf("0.0.0.0:%d", *pgPort)
@@ -139,7 +161,6 @@ func handleConnection(conn net.Conn) {
 		backend = pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn)
 	} else {
 		slog.Info("No SSL request, processing startup message directly")
-
 		bufferedReader := io.MultiReader(bytes.NewReader(buf), conn)
 		backend = pgproto3.NewBackend(pgproto3.NewChunkReader(bufferedReader), conn)
 	}
@@ -185,7 +206,7 @@ func handleConnection(conn net.Conn) {
 	}
 
 	err = backend.Send(&pgproto3.ReadyForQuery{
-		TxStatus: 'I',
+		TxStatus: 'I', // 'I' = Idle
 	})
 	if err != nil {
 		slog.Error("Failed to send ReadyForQuery", "error", err)
@@ -193,6 +214,9 @@ func handleConnection(conn net.Conn) {
 	}
 
 	slog.Info("PostgreSQL handshake completed successfully")
+
+	var txnBuffer []string
+	inTxn := false
 
 	for {
 		msg, err := backend.Receive()
@@ -210,6 +234,119 @@ func handleConnection(conn net.Conn) {
 			slog.Info("Received query", "sql", v.String)
 
 			sqlUpper := strings.ToUpper(strings.TrimSpace(v.String))
+
+			// --- FIX: USE HASPREFIX FOR TRANSACTIONS ---
+			if strings.HasPrefix(sqlUpper, "BEGIN") {
+				inTxn = true
+				txnBuffer = nil
+				slog.Info("Transaction started")
+
+				err = backend.Send(&pgproto3.CommandComplete{
+					CommandTag: []byte("BEGIN"),
+				})
+				if err != nil {
+					return
+				}
+
+				err = backend.Send(&pgproto3.ReadyForQuery{
+					TxStatus: 'T', // 'T' = In Transaction block
+				})
+				if err != nil {
+					return
+				}
+				continue
+			}
+
+			if strings.HasPrefix(sqlUpper, "ROLLBACK") {
+				inTxn = false
+				txnBuffer = nil
+				slog.Info("Transaction rolled back")
+
+				err = backend.Send(&pgproto3.CommandComplete{
+					CommandTag: []byte("ROLLBACK"),
+				})
+				if err != nil {
+					return
+				}
+
+				err = backend.Send(&pgproto3.ReadyForQuery{
+					TxStatus: 'I', // 'I' = Idle
+				})
+				if err != nil {
+					return
+				}
+				continue
+			}
+
+			if strings.HasPrefix(sqlUpper, "COMMIT") {
+				slog.Info("Committing transaction", "statements", len(txnBuffer))
+
+				if len(txnBuffer) > 0 {
+					err = globalStore.ReplicateBatch(txnBuffer)
+					if err != nil {
+						slog.Error("Failed to replicate batch", "error", err)
+						err = backend.Send(&pgproto3.ErrorResponse{
+							Severity: "ERROR",
+							Code:     "42000",
+							Message:  err.Error(),
+						})
+						if err != nil {
+							return
+						}
+
+						// On error, we are back to Idle
+						err = backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+						if err != nil {
+							return
+						}
+						return
+					}
+				}
+
+				inTxn = false
+				txnBuffer = nil
+
+				err = backend.Send(&pgproto3.CommandComplete{
+					CommandTag: []byte("COMMIT"),
+				})
+				if err != nil {
+					return
+				}
+
+				err = backend.Send(&pgproto3.ReadyForQuery{
+					TxStatus: 'I', // 'I' = Idle
+				})
+				if err != nil {
+					return
+				}
+				continue
+			}
+			// --- FIX END ---
+
+			// Handling buffered commands (inside transaction)
+			if inTxn {
+				txnBuffer = append(txnBuffer, v.String)
+				slog.Info("Buffered statement in transaction", "count", len(txnBuffer))
+
+				commandTag := getCommandTag(sqlUpper)
+
+				err = backend.Send(&pgproto3.CommandComplete{
+					CommandTag: []byte(commandTag),
+				})
+				if err != nil {
+					return
+				}
+
+				err = backend.Send(&pgproto3.ReadyForQuery{
+					TxStatus: 'T', // Keep status 'T'
+				})
+				if err != nil {
+					return
+				}
+				continue
+			}
+
+			// Handling atomic commands (outside transaction)
 			isWrite := strings.HasPrefix(sqlUpper, "INSERT") ||
 				strings.HasPrefix(sqlUpper, "UPDATE") ||
 				strings.HasPrefix(sqlUpper, "DELETE") ||
@@ -217,114 +354,68 @@ func handleConnection(conn net.Conn) {
 				strings.HasPrefix(sqlUpper, "DROP") ||
 				strings.HasPrefix(sqlUpper, "ALTER")
 
-			var commandTag string
-
 			if isWrite {
 				slog.Info("Routing to Replicate (distributed write)")
 				err = globalStore.Replicate(v.String)
 				if err != nil {
 					slog.Error("Failed to replicate command", "error", err)
-					err = backend.Send(&pgproto3.ErrorResponse{
+					backend.Send(&pgproto3.ErrorResponse{
 						Severity: "ERROR",
 						Code:     "42000",
 						Message:  err.Error(),
 					})
-					if err != nil {
-						slog.Error("Failed to send ErrorResponse", "error", err)
-					}
-					err = backend.Send(&pgproto3.ReadyForQuery{
-						TxStatus: 'I',
-					})
-					if err != nil {
-						slog.Error("Failed to send ReadyForQuery", "error", err)
-					}
+					backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 					return
 				}
 
-				if strings.HasPrefix(sqlUpper, "INSERT") {
-					commandTag = "INSERT 0 1"
-				} else if strings.HasPrefix(sqlUpper, "UPDATE") {
-					commandTag = "UPDATE 1"
-				} else if strings.HasPrefix(sqlUpper, "DELETE") {
-					commandTag = "DELETE 1"
-				} else if strings.HasPrefix(sqlUpper, "CREATE") {
-					commandTag = "CREATE TABLE"
-				} else if strings.HasPrefix(sqlUpper, "DROP") {
-					commandTag = "DROP TABLE"
-				} else if strings.HasPrefix(sqlUpper, "ALTER") {
-					commandTag = "ALTER TABLE"
-				} else {
-					commandTag = "OK"
-				}
+				commandTag := getCommandTag(sqlUpper)
 
 				err = backend.Send(&pgproto3.CommandComplete{
 					CommandTag: []byte(commandTag),
 				})
 				if err != nil {
-					slog.Error("Failed to send CommandComplete", "error", err)
 					return
 				}
 
-				err = backend.Send(&pgproto3.ReadyForQuery{
-					TxStatus: 'I',
-				})
+				err = backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 				if err != nil {
-					slog.Error("Failed to send ReadyForQuery", "error", err)
 					return
 				}
+
 			} else {
+				// READ Query
 				slog.Info("Routing to Query (local read)")
 				fieldDescriptions, resultRows, err := globalStore.Query(v.String)
 				if err != nil {
 					slog.Error("Failed to execute query", "error", err)
-					err = backend.Send(&pgproto3.ErrorResponse{
+					backend.Send(&pgproto3.ErrorResponse{
 						Severity: "ERROR",
 						Code:     "42000",
 						Message:  err.Error(),
 					})
-					if err != nil {
-						slog.Error("Failed to send ErrorResponse", "error", err)
-					}
-					err = backend.Send(&pgproto3.ReadyForQuery{
-						TxStatus: 'I',
-					})
-					if err != nil {
-						slog.Error("Failed to send ReadyForQuery", "error", err)
-					}
+					backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 					return
 				}
 
-				err = backend.Send(&pgproto3.RowDescription{
-					Fields: fieldDescriptions,
-				})
+				err = backend.Send(&pgproto3.RowDescription{Fields: fieldDescriptions})
 				if err != nil {
-					slog.Error("Failed to send RowDescription", "error", err)
 					return
 				}
 
 				for _, row := range resultRows {
-					err = backend.Send(&pgproto3.DataRow{
-						Values: row,
-					})
+					err = backend.Send(&pgproto3.DataRow{Values: row})
 					if err != nil {
-						slog.Error("Failed to send DataRow", "error", err)
 						return
 					}
 				}
 
-				err = backend.Send(&pgproto3.CommandComplete{
-					CommandTag: []byte("SELECT"),
-				})
+				err = backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT")})
 				if err != nil {
-					slog.Error("Failed to send CommandComplete", "error", err)
 					return
 				}
 
-				err = backend.Send(&pgproto3.ReadyForQuery{
-					TxStatus: 'I',
-				})
+				err = backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 				if err != nil {
-					slog.Error("Failed to send ReadyForQuery", "error", err)
 					return
 				}
 			}
@@ -337,6 +428,29 @@ func handleConnection(conn net.Conn) {
 			slog.Warn("Unknown message type", "type", msg)
 		}
 	}
+}
+
+// Helper to guess command tags for Postgres
+func getCommandTag(sql string) string {
+	if strings.HasPrefix(sql, "INSERT") {
+		return "INSERT 0 1"
+	}
+	if strings.HasPrefix(sql, "UPDATE") {
+		return "UPDATE 1"
+	}
+	if strings.HasPrefix(sql, "DELETE") {
+		return "DELETE 1"
+	}
+	if strings.HasPrefix(sql, "CREATE") {
+		return "CREATE TABLE"
+	}
+	if strings.HasPrefix(sql, "DROP") {
+		return "DROP TABLE"
+	}
+	if strings.HasPrefix(sql, "ALTER") {
+		return "ALTER TABLE"
+	}
+	return "OK"
 }
 
 func startAdminServer(port int, nodeID string, raftPort int) {
@@ -409,7 +523,7 @@ func joinCluster(leaderAddr, nodeID, raftAddr string) error {
 	}
 
 	joinURL := fmt.Sprintf("%s/join", leaderAddr)
-	slog.Info("Sending join request", "url", joinURL, "node_id", nodeID, "raft_addr", raftAddr)
+	// slog.Info("Sending join request", "url", joinURL)
 
 	resp, err := http.Post(joinURL, "application/json", bytes.NewReader(data))
 	if err != nil {

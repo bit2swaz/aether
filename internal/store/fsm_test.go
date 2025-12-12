@@ -210,18 +210,57 @@ func TestSnapshotAndRestore(t *testing.T) {
 	}
 	defer store.Close()
 
+	// Create test table and data
+	_, err = store.db.Exec("CREATE TABLE test (id INTEGER, value TEXT)")
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	_, err = store.db.Exec("INSERT INTO test VALUES (1, 'test')")
+	if err != nil {
+		t.Fatalf("Failed to insert data: %v", err)
+	}
+
+	// Test Snapshot
 	snapshot, err := store.Snapshot()
 	if err != nil {
-		t.Errorf("Snapshot returned unexpected error: %v", err)
+		t.Fatalf("Snapshot returned error: %v", err)
 	}
-	if snapshot != nil {
-		t.Errorf("Expected nil snapshot, got %v", snapshot)
+	if snapshot == nil {
+		t.Fatal("Expected snapshot, got nil")
 	}
-	t.Log("Snapshot() returns nil as expected")
+	t.Log("✓ Snapshot created successfully")
 
-	err = store.Restore(nil)
-	if err != nil {
-		t.Errorf("Restore returned unexpected error: %v", err)
+	// Verify it's an FSMSnapshot
+	fsmSnapshot, ok := snapshot.(*FSMSnapshot)
+	if !ok {
+		t.Fatal("Snapshot is not an FSMSnapshot")
 	}
-	t.Log("Restore() returns nil as expected")
+	defer fsmSnapshot.Release()
+
+	// Open snapshot file for restore
+	snapshotFile, err := os.Open(fsmSnapshot.path)
+	if err != nil {
+		t.Fatalf("Failed to open snapshot file: %v", err)
+	}
+	defer snapshotFile.Close()
+
+	// Test Restore
+	err = store.Restore(snapshotFile)
+	if err != nil {
+		t.Fatalf("Restore returned error: %v", err)
+	}
+	t.Log("✓ Restore completed successfully")
+
+	// Verify data is present after restore
+	var count int
+	err = store.db.QueryRow("SELECT COUNT(*) FROM test").Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query after restore: %v", err)
+	}
+
+	if count != 1 {
+		t.Fatalf("Expected 1 row after restore, got %d", count)
+	}
+	t.Log("✓ Data verified after restore")
 }

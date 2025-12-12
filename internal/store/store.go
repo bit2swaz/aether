@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -13,8 +15,9 @@ import (
 )
 
 type LogCommand struct {
-	Type string
-	SQL  string
+	Type  string
+	SQL   string
+	Batch []string
 }
 
 type ApplyResponse struct {
@@ -23,8 +26,9 @@ type ApplyResponse struct {
 }
 
 type Store struct {
-	db   *sql.DB
-	raft *raft.Raft
+	db     *sql.DB
+	dbPath string
+	raft   *raft.Raft
 }
 
 func New(dbPath string) (*Store, error) {
@@ -40,7 +44,7 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, dbPath: dbPath}, nil
 }
 
 func (s *Store) Close() error {
@@ -132,16 +136,105 @@ func (s *Store) Apply(log *raft.Log) interface{} {
 		}
 	}
 
+	if cmd.Type == "BATCH" {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return &ApplyResponse{
+				Error: fmt.Errorf("failed to begin transaction: %w", err),
+			}
+		}
+
+		for _, sql := range cmd.Batch {
+			_, err = tx.Exec(sql)
+			if err != nil {
+				tx.Rollback()
+				return &ApplyResponse{
+					Error: fmt.Errorf("failed to execute batch statement: %w", err),
+				}
+			}
+		}
+
+		err = tx.Commit()
+		return &ApplyResponse{
+			Error: err,
+		}
+	}
+
 	return &ApplyResponse{
 		Error: fmt.Errorf("unknown command type: %s", cmd.Type),
 	}
 }
 
 func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
-	return nil, nil
+	tempID := fmt.Sprintf("%d", time.Now().UnixNano())
+	snapshotPath := filepath.Join(filepath.Dir(s.dbPath), fmt.Sprintf("snapshot-%s.db", tempID))
+
+	_, err := s.db.Exec(fmt.Sprintf("VACUUM INTO '%s'", snapshotPath))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create snapshot: %w", err)
+	}
+
+	file, err := os.Open(snapshotPath)
+	if err != nil {
+		os.Remove(snapshotPath)
+		return nil, fmt.Errorf("failed to open snapshot file: %w", err)
+	}
+
+	return &FSMSnapshot{
+		file: file,
+		path: snapshotPath,
+	}, nil
 }
 
 func (s *Store) Restore(snapshot io.ReadCloser) error {
+	defer snapshot.Close()
+
+	fmt.Println("[INFO] raft-fsm: starting snapshot restore...")
+
+	if err := s.db.Close(); err != nil {
+		return fmt.Errorf("failed to close database before restore: %w", err)
+	}
+
+	tempID := fmt.Sprintf("%d", time.Now().UnixNano())
+	tempPath := filepath.Join(filepath.Dir(s.dbPath), fmt.Sprintf("restore-%s.db", tempID))
+
+	tempFile, err := os.Create(tempPath)
+	if err != nil {
+		return fmt.Errorf("failed to create temp restore file: %w", err)
+	}
+
+	bytesWritten, err := io.Copy(tempFile, snapshot)
+	tempFile.Close()
+	if err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to copy snapshot data: %w", err)
+	}
+
+	fmt.Printf("[INFO] raft-fsm: copied %d bytes from snapshot\n", bytesWritten)
+
+	os.Remove(s.dbPath + "-shm")
+	os.Remove(s.dbPath + "-wal")
+
+	if err := os.Rename(tempPath, s.dbPath); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to rename temp file to database path: %w", err)
+	}
+
+	fmt.Printf("[INFO] raft-fsm: restored snapshot to %s\n", s.dbPath)
+
+	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on", s.dbPath)
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to re-open database after restore: %w", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return fmt.Errorf("failed to ping database after restore: %w", err)
+	}
+
+	s.db = db
+	fmt.Println("[INFO] raft-fsm: snapshot restore complete!")
 	return nil
 }
 
@@ -181,4 +274,63 @@ func (s *Store) Replicate(sql string) error {
 	}
 
 	return nil
+}
+
+func (s *Store) ReplicateBatch(batch []string) error {
+	if s.raft == nil {
+		return fmt.Errorf("raft instance not initialized")
+	}
+
+	cmd := LogCommand{
+		Type:  "BATCH",
+		Batch: batch,
+	}
+
+	bytes, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to marshal batch command: %w", err)
+	}
+
+	timeout := 10 * time.Second
+	future := s.raft.Apply(bytes, timeout)
+
+	if err := future.Error(); err != nil {
+		return fmt.Errorf("raft apply failed: %w", err)
+	}
+
+	response := future.Response()
+	if response != nil {
+		if applyResp, ok := response.(*ApplyResponse); ok {
+			if applyResp.Error != nil {
+				return fmt.Errorf("fsm execution failed: %w", applyResp.Error)
+			}
+		}
+	}
+
+	return nil
+}
+
+type FSMSnapshot struct {
+	file *os.File
+	path string
+}
+
+func (f *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
+	defer f.file.Close()
+	defer os.Remove(f.path)
+
+	_, err := io.Copy(sink, f.file)
+	if err != nil {
+		sink.Cancel()
+		return fmt.Errorf("failed to copy snapshot to sink: %w", err)
+	}
+
+	return sink.Close()
+}
+
+func (f *FSMSnapshot) Release() {
+	if f.file != nil {
+		f.file.Close()
+	}
+	os.Remove(f.path)
 }
