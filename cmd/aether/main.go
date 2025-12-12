@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,10 +14,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bit2swaz/aether/internal/api"
 	"github.com/bit2swaz/aether/internal/consensus"
+	"github.com/bit2swaz/aether/internal/metrics"
 	"github.com/bit2swaz/aether/internal/store"
-	"github.com/hashicorp/raft"
 	"github.com/jackc/pgproto3/v2"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -66,6 +67,35 @@ func main() {
 
 	globalStore.SetRaft(globalConsensus.Raft())
 
+	// Initialize Prometheus metrics
+	metrics.Init()
+	go startMetricsServer(9090)
+	slog.Info("Metrics server starting on :9090")
+
+	// Track Raft state and commit index
+	go func() {
+		// Give Raft a moment to initialize
+		time.Sleep(500 * time.Millisecond)
+
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		// Update immediately on start
+		updateMetrics := func() {
+			state := globalConsensus.Raft().State()
+			metrics.SetRaftState(int(state))
+
+			commitIndex := globalConsensus.Raft().LastIndex()
+			metrics.SetCommitIndex(commitIndex)
+		}
+
+		updateMetrics() // Initial update
+
+		for range ticker.C {
+			updateMetrics()
+		}
+	}()
+
 	// Simple bootstrap wait
 	if *nodeID == "node1" {
 		// We don't strictly panic here because in a restart scenario,
@@ -80,7 +110,8 @@ func main() {
 		}()
 	}
 
-	go startAdminServer(*httpPort, *nodeID, *raftPort)
+	adminServer := api.NewServer(globalConsensus, *nodeID, *httpPort)
+	go adminServer.Start()
 
 	// Give the admin server a moment to start
 	if *nodeID == "node1" {
@@ -95,7 +126,7 @@ func main() {
 				// Wait a bit before first attempt to let leader settle
 				time.Sleep(time.Duration(1000) * time.Millisecond)
 
-				err = joinCluster(*joinAddr, *nodeID, fmt.Sprintf("127.0.0.1:%d", *raftPort))
+				err = api.JoinCluster(*joinAddr, *nodeID, fmt.Sprintf("127.0.0.1:%d", *raftPort))
 				if err == nil {
 					slog.Info("Successfully joined cluster", "leader", *joinAddr)
 					return
@@ -135,6 +166,9 @@ func startServer(addr string) error {
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
+
+	metrics.IncConnection()
+	defer metrics.DecConnection()
 
 	remoteAddr := conn.RemoteAddr().String()
 	slog.Info("New connection from " + remoteAddr)
@@ -356,6 +390,7 @@ func handleConnection(conn net.Conn) {
 
 			if isWrite {
 				slog.Info("Routing to Replicate (distributed write)")
+				metrics.IncSQL("write")
 				err = globalStore.Replicate(v.String)
 				if err != nil {
 					slog.Error("Failed to replicate command", "error", err)
@@ -385,6 +420,7 @@ func handleConnection(conn net.Conn) {
 			} else {
 				// READ Query
 				slog.Info("Routing to Query (local read)")
+				metrics.IncSQL("read")
 				fieldDescriptions, resultRows, err := globalStore.Query(v.String)
 				if err != nil {
 					slog.Error("Failed to execute query", "error", err)
@@ -453,87 +489,12 @@ func getCommandTag(sql string) string {
 	return "OK"
 }
 
-func startAdminServer(port int, nodeID string, raftPort int) {
-	http.HandleFunc("/join", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req struct {
-			NodeID   string `json:"node_id"`
-			RaftAddr string `json:"raft_addr"`
-		}
-
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			slog.Error("Failed to decode join request", "error", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		slog.Info("Received join request", "node_id", req.NodeID, "raft_addr", req.RaftAddr)
-
-		f := globalConsensus.Raft().AddVoter(
-			raft.ServerID(req.NodeID),
-			raft.ServerAddress(req.RaftAddr),
-			0,
-			0,
-		)
-
-		if err := f.Error(); err != nil {
-			slog.Error("Failed to add voter", "error", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		slog.Info("Successfully added voter", "node_id", req.NodeID)
-
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
-
-	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		leader := globalConsensus.Raft().Leader()
-		state := globalConsensus.Raft().State()
-
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"node_id": nodeID,
-			"leader":  string(leader),
-			"state":   state.String(),
-		})
-	})
-
+func startMetricsServer(port int) {
 	addr := fmt.Sprintf(":%d", port)
-	slog.Info("Starting admin HTTP server", "addr", addr)
+	http.Handle("/metrics", promhttp.Handler())
 
+	slog.Info("Metrics server listening", "address", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
-		slog.Error("Admin server failed", "error", err)
+		slog.Error("Metrics server failed", "error", err)
 	}
-}
-
-func joinCluster(leaderAddr, nodeID, raftAddr string) error {
-	req := map[string]string{
-		"node_id":   nodeID,
-		"raft_addr": raftAddr,
-	}
-
-	data, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("failed to marshal join request: %w", err)
-	}
-
-	joinURL := fmt.Sprintf("%s/join", leaderAddr)
-	// slog.Info("Sending join request", "url", joinURL)
-
-	resp, err := http.Post(joinURL, "application/json", bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("failed to send join request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("join request failed with status: %d", resp.StatusCode)
-	}
-
-	return nil
 }

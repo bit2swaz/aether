@@ -3,6 +3,7 @@
 *.db-journal
 *.db-wal
 *.db-shm
+*.log
 
 # Raft Data
 raft-data/

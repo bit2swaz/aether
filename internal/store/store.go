@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -62,6 +63,62 @@ func (s *Store) Ping() error {
 }
 
 func (s *Store) Query(sql string) ([]pgproto3.FieldDescription, [][][]byte, error) {
+	// Intercept system_nodes query to return Raft cluster information
+	if strings.EqualFold(strings.TrimSpace(sql), "SELECT * FROM system_nodes;") {
+		if s.raft == nil {
+			return nil, nil, fmt.Errorf("raft not initialized")
+		}
+
+		future := s.raft.GetConfiguration()
+		if err := future.Error(); err != nil {
+			return nil, nil, fmt.Errorf("failed to get raft configuration: %w", err)
+		}
+
+		// Build field descriptions for: node_id, address, suffrage
+		fieldDescriptions := []pgproto3.FieldDescription{
+			{
+				Name:                 []byte("node_id"),
+				TableOID:             0,
+				TableAttributeNumber: 0,
+				DataTypeOID:          OIDText,
+				DataTypeSize:         -1,
+				TypeModifier:         -1,
+				Format:               0,
+			},
+			{
+				Name:                 []byte("address"),
+				TableOID:             0,
+				TableAttributeNumber: 0,
+				DataTypeOID:          OIDText,
+				DataTypeSize:         -1,
+				TypeModifier:         -1,
+				Format:               0,
+			},
+			{
+				Name:                 []byte("suffrage"),
+				TableOID:             0,
+				TableAttributeNumber: 0,
+				DataTypeOID:          OIDText,
+				DataTypeSize:         -1,
+				TypeModifier:         -1,
+				Format:               0,
+			},
+		}
+
+		// Build result rows from Raft servers
+		var resultRows [][][]byte
+		for _, server := range future.Configuration().Servers {
+			row := [][]byte{
+				[]byte(string(server.ID)),
+				[]byte(string(server.Address)),
+				[]byte(server.Suffrage.String()),
+			}
+			resultRows = append(resultRows, row)
+		}
+
+		return fieldDescriptions, resultRows, nil
+	}
+
 	rows, err := s.db.Query(sql)
 	if err != nil {
 		return nil, nil, fmt.Errorf("query failed: %w", err)
