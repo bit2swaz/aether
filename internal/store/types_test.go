@@ -130,5 +130,5 @@ func TestEncodeValueOIDConstants(t *testing.T) {
 		t.Errorf("OIDTimestamp should be 1114, got %d", OIDTimestamp)
 	}
 
-	t.Log("✓ All OID constants are correct")
+	t.Log("All OID constants are correct")
 }

@@ -1,0 +1,78 @@
+services:
+  node1:
+    build: .
+    image: aether:latest
+    container_name: aether-node1
+    hostname: node1
+    command:
+      - start
+      - --id=node1
+      - --port=5432
+      - --raft-port=7000
+      - --http-port=8080
+      - --raft-advertise=node1:7000
+    ports:
+      - "5432:5432"
+      - "7000:7000"
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - ./data/node1:/node1-data
+    networks:
+      - aether-network
+    restart: unless-stopped
+  node2:
+    build: .
+    image: aether:latest
+    container_name: aether-node2
+    hostname: node2
+    command:
+      - start
+      - --id=node2
+      - --port=5432
+      - --raft-port=7000
+      - --http-port=8080
+      - --join=http://node1:8080
+      - --raft-advertise=node2:7000
+    ports:
+      - "5433:5432"
+      - "7001:7000"
+      - "8081:8080"
+    volumes:
+      - ./data/node2:/node2-data
+    networks:
+      - aether-network
+    depends_on:
+      - node1
+    restart: unless-stopped
+  node3:
+    build: .
+    image: aether:latest
+    container_name: aether-node3
+    hostname: node3
+    command:
+      - start
+      - --id=node3
+      - --port=5432
+      - --raft-port=7000
+      - --http-port=8080
+      - --join=http://node1:8080
+      - --raft-advertise=node3:7000
+    ports:
+      - "5434:5432"
+      - "7002:7000"
+      - "8082:8080"
+    volumes:
+      - ./data/node3:/node3-data
+    networks:
+      - aether-network
+    depends_on:
+      - node1
+    restart: unless-stopped
+networks:
+  aether-network:
+    driver: bridge
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

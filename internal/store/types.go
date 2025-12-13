@@ -6,10 +6,10 @@ import (
 )
 
 const (
-	OIDBytea     uint32 = 17  
-	OIDInt8      uint32 = 20  
-	OIDText      uint32 = 25  
-	OIDFloat8    uint32 = 701 
+	OIDBytea     uint32 = 17
+	OIDInt8      uint32 = 20
+	OIDText      uint32 = 25
+	OIDFloat8    uint32 = 701
 	OIDTimestamp uint32 = 1114
 )
 

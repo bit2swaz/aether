@@ -1,23 +1,19 @@
-# Database Files (SQLite)
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
 *.log
 
-# Raft Data
 raft-data/
 node*/
 
-# Binaries
-aether
+./aether
 flood
 bin/
 *.exe
 
-# Test Files
+scripts/
 *.sh
 
-# OS/IDE
 .DS_Store
 .vscode/
