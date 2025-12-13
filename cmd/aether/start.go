@@ -1,4 +1,5 @@
 package main
+
 import (
 	"bytes"
 	"encoding/binary"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
 	"github.com/bit2swaz/aether/internal/api"
 	"github.com/bit2swaz/aether/internal/consensus"
 	"github.com/bit2swaz/aether/internal/metrics"
@@ -21,6 +23,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 )
+
+const MaxTxnBufferSize = 2000
+
 var (
 	globalStore     *store.Store
 	globalConsensus *consensus.Consensus
@@ -39,6 +44,7 @@ var startCmd = &cobra.Command{
 	Long:  `Start the Aether database node with the specified configuration.`,
 	RunE:  runStart,
 }
+
 func init() {
 	startCmd.PersistentFlags().StringVar(&nodeID, "id", "node1", "Node ID")
 	startCmd.PersistentFlags().IntVar(&pgPort, "port", 5432, "PostgreSQL protocol port")
@@ -79,13 +85,19 @@ func runStart(cmd *cobra.Command, args []string) error {
 		time.Sleep(500 * time.Millisecond)
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
+		lastState := -1
 		updateMetrics := func() {
-			state := globalConsensus.Raft().State()
-			metrics.SetRaftState(int(state))
+			currentState := globalConsensus.Raft().State()
+			metrics.SetRaftState(int(currentState))
 			commitIndex := globalConsensus.Raft().LastIndex()
 			metrics.SetCommitIndex(commitIndex)
+
+			if lastState != -1 && int(currentState) != lastState {
+				metrics.IncLeaderChange()
+			}
+			lastState = int(currentState)
 		}
-		updateMetrics()  
+		updateMetrics()
 		for range ticker.C {
 			updateMetrics()
 		}
@@ -242,7 +254,7 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 	err = backend.Send(&pgproto3.ReadyForQuery{
-		TxStatus: 'I',  
+		TxStatus: 'I',
 	})
 	if err != nil {
 		slog.Error("Failed to send ReadyForQuery", "error", err)
@@ -276,7 +288,7 @@ func handleConnection(conn net.Conn) {
 					return
 				}
 				err = backend.Send(&pgproto3.ReadyForQuery{
-					TxStatus: 'T',  
+					TxStatus: 'T',
 				})
 				if err != nil {
 					return
@@ -294,7 +306,7 @@ func handleConnection(conn net.Conn) {
 					return
 				}
 				err = backend.Send(&pgproto3.ReadyForQuery{
-					TxStatus: 'I',  
+					TxStatus: 'I',
 				})
 				if err != nil {
 					return
@@ -331,7 +343,7 @@ func handleConnection(conn net.Conn) {
 					return
 				}
 				err = backend.Send(&pgproto3.ReadyForQuery{
-					TxStatus: 'I',  
+					TxStatus: 'I',
 				})
 				if err != nil {
 					return
@@ -339,6 +351,26 @@ func handleConnection(conn net.Conn) {
 				continue
 			}
 			if inTxn {
+				if len(txnBuffer) >= MaxTxnBufferSize {
+					slog.Warn("Transaction buffer limit reached", "limit", MaxTxnBufferSize)
+					err = backend.Send(&pgproto3.ErrorResponse{
+						Severity: "ERROR",
+						Code:     "54000",
+						Message:  "Transaction buffer limit reached",
+					})
+					if err != nil {
+						return
+					}
+					err = backend.Send(&pgproto3.ReadyForQuery{
+						TxStatus: 'I',
+					})
+					if err != nil {
+						return
+					}
+					txnBuffer = nil
+					inTxn = false
+					continue
+				}
 				txnBuffer = append(txnBuffer, v.String)
 				slog.Info("Buffered statement in transaction", "count", len(txnBuffer))
 				commandTag := getCommandTag(sqlUpper)
@@ -349,7 +381,7 @@ func handleConnection(conn net.Conn) {
 					return
 				}
 				err = backend.Send(&pgproto3.ReadyForQuery{
-					TxStatus: 'T',  
+					TxStatus: 'T',
 				})
 				if err != nil {
 					return

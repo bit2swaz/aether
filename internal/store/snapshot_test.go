@@ -1,8 +1,12 @@
 package store
 
 import (
+	"bytes"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -399,4 +403,192 @@ func TestSnapshotRestore(t *testing.T) {
 	t.Log("  Store2 has all 100 rows")
 	t.Log("  Store1 remains usable after snapshot")
 	t.Log("========================================")
+}
+
+type mockSnapshotSink struct {
+	bytes.Buffer
+	cancelled bool
+}
+
+func (m *mockSnapshotSink) Write(p []byte) (n int, err error) {
+	return m.Buffer.Write(p)
+}
+
+func (m *mockSnapshotSink) Close() error {
+	return nil
+}
+
+func (m *mockSnapshotSink) Cancel() error {
+	m.cancelled = true
+	return nil
+}
+
+func (m *mockSnapshotSink) ID() string {
+	return "mock-snapshot"
+}
+
+func TestSnapshotVersionPersist(t *testing.T) {
+	dbPath := "test_snapshot_version.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-shm")
+	defer os.Remove(dbPath + "-wal")
+
+	store, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	_, err = store.db.Exec("CREATE TABLE test_data (id INTEGER, value TEXT)")
+	if err != nil {
+		t.Fatalf("Failed to create test table: %v", err)
+	}
+
+	_, err = store.db.Exec("INSERT INTO test_data (id, value) VALUES (1, 'test')")
+	if err != nil {
+		t.Fatalf("Failed to insert test data: %v", err)
+	}
+
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatalf("Failed to create snapshot: %v", err)
+	}
+
+	sink := &mockSnapshotSink{}
+	err = snapshot.Persist(sink)
+	if err != nil {
+		t.Fatalf("Failed to persist snapshot: %v", err)
+	}
+
+	snapshotBytes := sink.Bytes()
+	if len(snapshotBytes) == 0 {
+		t.Fatal("Snapshot is empty")
+	}
+
+	firstByte := snapshotBytes[0]
+	if firstByte != SnapshotVersion {
+		t.Errorf("Expected first byte to be %d (SnapshotVersion), got %d", SnapshotVersion, firstByte)
+	}
+	t.Logf("First byte correctly set to version %d", firstByte)
+
+	dbPath2 := "test_snapshot_restore.db"
+	defer os.Remove(dbPath2)
+	defer os.Remove(dbPath2 + "-shm")
+	defer os.Remove(dbPath2 + "-wal")
+
+	store2, err := New(dbPath2)
+	if err != nil {
+		t.Fatalf("Failed to create second store: %v", err)
+	}
+	defer store2.Close()
+
+	reader := io.NopCloser(bytes.NewReader(snapshotBytes))
+	err = store2.Restore(reader)
+	if err != nil {
+		t.Fatalf("Failed to restore snapshot with valid version: %v", err)
+	}
+
+	_, rows, err := store2.Query("SELECT id, value FROM test_data")
+	if err != nil {
+		t.Fatalf("Failed to query restored data: %v", err)
+	}
+
+	if len(rows) != 1 {
+		t.Fatalf("Expected 1 row, got %d", len(rows))
+	}
+
+	if string(rows[0][0]) != "1" || string(rows[0][1]) != "test" {
+		t.Errorf("Data mismatch after restore: got id=%s, value=%s", string(rows[0][0]), string(rows[0][1]))
+	}
+
+	t.Log("Snapshot persisted and restored successfully with correct version")
+}
+
+func TestSnapshotIncompatibleVersion(t *testing.T) {
+	dbPath := "test_incompatible.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-shm")
+	defer os.Remove(dbPath + "-wal")
+
+	store, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	testCases := []struct {
+		name    string
+		version byte
+	}{
+		{"version 0", 0x00},
+		{"version 2", 0x02},
+		{"version 99", 0x63},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath2 := fmt.Sprintf("test_invalid_%d.db", tc.version)
+			defer os.Remove(dbPath2)
+			defer os.Remove(dbPath2 + "-shm")
+			defer os.Remove(dbPath2 + "-wal")
+
+			store2, err := New(dbPath2)
+			if err != nil {
+				t.Fatalf("Failed to create store: %v", err)
+			}
+			defer store2.Close()
+
+			invalidSnapshot := []byte{tc.version}
+			validDBData := make([]byte, 100)
+			for i := range validDBData {
+				validDBData[i] = 0x00
+			}
+			invalidSnapshot = append(invalidSnapshot, validDBData...)
+
+			reader := io.NopCloser(bytes.NewReader(invalidSnapshot))
+			err = store2.Restore(reader)
+
+			if err == nil {
+				t.Fatalf("Expected error for incompatible version %d, but got nil", tc.version)
+			}
+
+			if !strings.Contains(err.Error(), "incompatible snapshot version") {
+				t.Errorf("Expected error to contain 'incompatible snapshot version', got: %v", err)
+			}
+
+			expectedVersionInError := fmt.Sprintf("%d", tc.version)
+			if !strings.Contains(err.Error(), expectedVersionInError) {
+				t.Errorf("Expected error to contain version number %s, got: %v", expectedVersionInError, err)
+			}
+
+			t.Logf("Correctly rejected version %d with error: %v", tc.version, err)
+		})
+	}
+}
+
+func TestSnapshotMissingVersion(t *testing.T) {
+	dbPath := "test_missing_version.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-shm")
+	defer os.Remove(dbPath + "-wal")
+
+	store, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	emptySnapshot := []byte{}
+	reader := io.NopCloser(bytes.NewReader(emptySnapshot))
+	err = store.Restore(reader)
+
+	if err == nil {
+		t.Fatal("Expected error when reading version from empty snapshot, but got nil")
+	}
+
+	if !strings.Contains(err.Error(), "failed to read snapshot version") {
+		t.Errorf("Expected error about reading version, got: %v", err)
+	}
+
+	t.Logf("Correctly rejected empty snapshot with error: %v", err)
 }

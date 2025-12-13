@@ -1,4 +1,5 @@
 package store
+
 import (
 	"database/sql"
 	"encoding/json"
@@ -8,10 +9,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
 	"github.com/hashicorp/raft"
 	"github.com/jackc/pgproto3/v2"
 	_ "github.com/mattn/go-sqlite3"
 )
+
+const SnapshotVersion byte = 1
+
 type LogCommand struct {
 	Type  string
 	SQL   string
@@ -26,6 +31,7 @@ type Store struct {
 	dbPath string
 	raft   *raft.Raft
 }
+
 func New(dbPath string) (*Store, error) {
 	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on", dbPath)
 	db, err := sql.Open("sqlite3", dsn)
@@ -206,6 +212,15 @@ func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
 func (s *Store) Restore(snapshot io.ReadCloser) error {
 	defer snapshot.Close()
 	fmt.Println("[INFO] raft-fsm: starting snapshot restore...")
+
+	versionBuf := make([]byte, 1)
+	if _, err := io.ReadFull(snapshot, versionBuf); err != nil {
+		return fmt.Errorf("failed to read snapshot version: %w", err)
+	}
+	if versionBuf[0] != SnapshotVersion {
+		return fmt.Errorf("incompatible snapshot version: %d", versionBuf[0])
+	}
+
 	if err := s.db.Close(); err != nil {
 		return fmt.Errorf("failed to close database before restore: %w", err)
 	}
@@ -299,13 +314,21 @@ func (s *Store) ReplicateBatch(batch []string) error {
 	}
 	return nil
 }
+
 type FSMSnapshot struct {
 	file *os.File
 	path string
 }
+
 func (f *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	defer f.file.Close()
 	defer os.Remove(f.path)
+
+	if _, err := sink.Write([]byte{SnapshotVersion}); err != nil {
+		sink.Cancel()
+		return fmt.Errorf("failed to write snapshot version: %w", err)
+	}
+
 	_, err := io.Copy(sink, f.file)
 	if err != nil {
 		sink.Cancel()

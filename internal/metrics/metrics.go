@@ -1,8 +1,10 @@
 package metrics
+
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
 var (
 	RaftState = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "aether_raft_state",
@@ -21,9 +23,15 @@ var (
 			Name: "aether_sql_queries_total",
 			Help: "Total number of SQL queries processed",
 		},
-		[]string{"type"},  
+		[]string{"type"},
 	)
+
+	LeaderChanges = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "aether_leader_changes_total",
+		Help: "Total number of leadership changes detected",
+	})
 )
+
 func Init() {
 }
 func SetRaftState(state int) {
@@ -40,4 +48,8 @@ func DecConnection() {
 }
 func IncSQL(opType string) {
 	SQLQueryCount.WithLabelValues(opType).Inc()
+}
+
+func IncLeaderChange() {
+	LeaderChanges.Inc()
 }
